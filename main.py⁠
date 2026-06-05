@@ -1,1 +1,150 @@
+import logging
+import asyncio
+import requests
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+# ==========================================
+# KONFIGURASI API (GANTI DENGAN MILIKMU)
+# ==========================================
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+MAGNIFIC_API_KEY = os.environ.get("MAGNIFIC_API_KEY")
+
+MAGNIFIC_BASE_URL = "https://api.magnific.com"
+
+# Setup Logging agar kita bisa melihat log error di terminal
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ==========================================
+# FUNGSI INTERAKSI KE API MAGNIFIC / KLING
+# ==========================================
+
+# 1. Fungsi untuk mendaftarkan task pembuatan video
+def trigger_kling_video(image_url, prompt="Cinematic motion, high quality"):
+    url = f"{MAGNIFIC_BASE_URL}/v1/ai/image-to-video/kling-v2-1-pro"
+    headers = {
+        "x-magnific-api-key": MAGNIFIC_API_KEY,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "image": image_url,
+        "prompt": prompt,
+        "duration": "5", # Pilihan: "5" atau "10"
+        "cfg_scale": 0.5
+    }
+    
+    response = requests.post(url, headers=headers, json=payload)
+    if response.status_code == 200:
+        return response.json().get("data", {}).get("task_id")
+    else:
+        logger.error(f"Gagal trigger API: {response.text}")
+        return None
+
+# 2. Fungsi untuk mengecek status video (Polling)
+# Catatan: Sesuaikan endpoint GET ini dengan dokumentasi Magnific aslimu jika berbeda
+def check_task_status(task_id):
+    url = f"{MAGNIFIC_BASE_URL}/v1/ai/tasks/{task_id}" # Endpoint standar pengecekan task Magnific
+    headers = {
+        "x-magnific-api-key": MAGNIFIC_API_KEY
+    }
+    
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            return response.json().get("data", {})
+    except Exception as e:
+        logger.error(f"Error saat cek status: {e}")
+    return None
+
+# ==========================================
+# LOGIKA BOT TELEGRAM
+# ==========================================
+
+# Command /start
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Halo! Kirimkan saya sebuah **Gambar**, lalu tuliskan **Prompt/Perintah** di bagian caption gambar tersebut untuk menjadikannya video menggunakan Kling 2.1 Pro!"
+    )
+
+# Handler ketika user mengirim foto
+async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Ambil foto dengan resolusi tertinggi yang dikirim user
+    photo = update.message.photo[-1]
+    prompt = update.message.caption if update.message.caption else "Cinematic motion, high quality"
+    
+    await update.message.reply_text("📥 Gambar diterima! Sedang mengunduh file gambar...")
+    
+    # Dapatkan public link/file path dari Telegram Server agar bisa dibaca oleh API Kling
+    tg_file = await context.bot.get_file(photo.file_id)
+    image_url = tg_file.file_path # Ini adalah URL publik sementara dari Telegram
+    
+    await update.message.reply_text("🚀 Mengirim request ke Kling 2.1 Pro. Mohon tunggu...")
+    
+    # Kirim ke API Kling
+    task_id = trigger_kling_video(image_url, prompt)
+    
+    if not task_id:
+        await update.message.reply_text("❌ Gagal memproses gambar ke AI. Coba lagi nanti atau cek API Key Anda.")
+        return
+    
+    status_message = await update.message.reply_text(f"⏳ Video sedang diproses dalam antrean...\nTask ID: `{task_id}`")
+    
+    # --- PROSES POLLING (MENUNGGU VIDEO SELESAI) ---
+    is_completed = False
+    attempts = 0
+    max_attempts = 40 # 40 x 15 detik = maks 10 menit batas tunggu
+    video_url = None
+    
+    while not is_completed and attempts < max_attempts:
+        await asyncio.sleep(15) # Tunggu 15 detik setiap pengecekan
+        attempts += 1
+        
+        task_data = check_task_status(task_id)
+        if not task_data:
+            continue
+            
+        status = task_data.get("status")
+        
+        if status == "COMPLETED":
+            # Ganti 'video_result_url' dengan key path asli dari response Magnific kamu jika berbeda
+            video_url = task_data.get("video_url") or task_data.get("result", {}).get("url")
+            is_completed = True
+            break
+        elif status == "FAILED":
+            await status_message.edit_text("❌ Pembuatan video gagal dari sisi server AI.")
+            return
+        else:
+            # Update status di chat (opsional, agar user tahu bot tidak hang)
+            try:
+                await status_message.edit_text(f"⏳ Masih diproses... (Status: {status} | Waktu berjalan: {attempts * 15}s)")
+            except:
+                pass # Menghindari error jika text-nya sama
+
+    # --- KIRIM HASIL KE USER ---
+    if is_completed and video_url:
+        await status_message.edit_text("✨ Video Selesai! Sedang mengirim ke Anda...")
+        try:
+            await update.message.reply_video(video=video_url, caption=f"🎬 Hasil Kling 2.1 Pro\nPrompt: {prompt}")
+        except Exception as e:
+            await update.message.reply_text(f"Video berhasil dibuat, tapi gagal mengirim file langsung. Anda bisa mendownloadnya di sini:\n{video_url}")
+    else:
+        await status_message.edit_text("⏱️ Waktu tunggu habis (Timeout). Video mungkin masih diproses di server Magnific, silakan cek berkala.")
+
+# ==========================================
+# MAIN FUNCTION UNTUK MENJALANKAN BOT
+# ==========================================
+def main():
+    # Inisialisasi Bot
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # Daftarkan command & handler
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_image))
+    
+    print("🤖 Bot Telegram Kling 2.1 sedang berjalan...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
 
